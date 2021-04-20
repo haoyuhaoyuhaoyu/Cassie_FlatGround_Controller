@@ -79,6 +79,7 @@ classdef FG_Controller <matlab.System & matlab.system.mixin.Propagates & matlab.
         fil_para_5;
         
         force_step_end_s;
+        
     end
     properties (Access = private, Constant)
         TorqueLimits = repmat([112.5;112.5;195.2;195.2;45],[2,1]);
@@ -86,6 +87,7 @@ classdef FG_Controller <matlab.System & matlab.system.mixin.Propagates & matlab.
             -0.3927, 0.2618;    -0.3927, 0.3927;    -0.8727, 1.3963;    -2.8623, -0.7330;   -2.4435, -0.5236];
         Ks1 = 1800;
         Ks2 = 1600;
+        Mg = 300;
     end
     properties (Access = protected)
  
@@ -97,7 +99,8 @@ classdef FG_Controller <matlab.System & matlab.system.mixin.Propagates & matlab.
         Toe_thigh_offset = 1.0996;
         safe_TorqueLimits = repmat([80;60;80;190;45],[2,1]);
         
-        standing_abduction_offset = 0.08;
+        %standing_abduction_offset = 0.08;
+        standing_abduction_offset = 0.02;
         bezier_degree = 5;
     end
     % PRIVATE PROPERTIES ====================================================
@@ -204,21 +207,60 @@ classdef FG_Controller <matlab.System & matlab.system.mixin.Propagates & matlab.
         lateral_move = 0;
         rotation_move = 0;
         
-        to_stand_step_count = 0;
+        to_stand_step_count = 0;      
+        % my control
+        Kp_roll_c = 100;
+        Kp_pitch_c = 100;
+        Kp_yaw_c = 100;
+        Kp_x_c = 100; % -76
+        Kp_y_c = 100;
+        Kp_z_c = 100;
         
+        Kd_roll_c = 10;
+        Kd_pitch_c = 10; 
+        Kd_yaw_c = 10;
+        Kd_x_c = 10; %50
+        Kd_y_c =10;
+        Kd_z_c = 10;        
+        
+        Kcp = 3;
 
+        qpitch_d = 0;
+        qroll_d = 0;
+        yaw_d = 0;
+        yaw_joint_d = 0;
+        
+        y_h = 0.135;
+        
+        x_d = 0;
+        z_d = 0.9;
+        y_d = 0;
     end % properties
     
     % PROTECTED METHODS =====================================================
     methods (Access = protected)
         
-        function [userInputs, Data] = stepImpl(obj, t, cassieOutputs, isSim, GaitLibrary, encoder_fil)
+        function [userInputs, Data, log_data] = stepImpl(obj, t, cassieOutputs, isSim, GaitLibrary, encoder_fil, pos)
             %STEPIMPL System output and state update equations.
             
             %% Initialize --------------------------------------------------------
+            log_data = zeros(38,1);
             Data = PreFunctions.Construct_Data;
             % Reset the desired motor torques to zero in case they aren't defined
             userInputs = CassieModule.getUserInStruct;
+            Kp_c = [obj.Kp_roll_c, 0      , 0    , 0  , 0  ,   0;
+            0      ,obj.Kp_pitch_c, 0    , 0  , 0  ,   0;
+            0      , 0      ,obj.Kp_yaw_c, 0  , 0  ,   0;
+            0      , 0      , 0    ,obj.Kp_x_c, 0  ,   0;
+            0      , 0      , 0    ,0   ,obj.Kp_y_c,   0;
+            0      , 0      , 0    ,0   , 0  ,obj.Kp_z_c];
+        
+            Kd_c = [obj.Kd_roll_c, 0      , 0    , 0  , 0  ,   0;
+            0      ,obj.Kd_pitch_c, 0    , 0  , 0  ,   0;
+            0      , 0      ,obj.Kd_yaw_c, 0  , 0  ,   0;
+            0      , 0      , 0    ,obj.Kd_x_c, 0  ,   0;
+            0      , 0      , 0    ,0   ,obj.Kd_y_c,   0;
+            0      , 0      , 0    ,0   , 0  ,obj.Kd_z_c];
             u = zeros(10,1);
             % Update the Cassie outputs data structure
             RadioButton = RadioChannelToButton(cassieOutputs.pelvis.radio.channel);
@@ -551,122 +593,90 @@ classdef FG_Controller <matlab.System & matlab.system.mixin.Propagates & matlab.
                 obj.com_pos_z_fil = YToolkits.first_order_filter(obj.com_pos_z_fil,com_pos(3),obj.fil_para_3);
                 %% walking
                 if obj.task == 1 % walking
-                    % Compute desired outputs ( here the outputs dose not
-                    % include torso orientation. the outputs will be
-                    % modified later
-                    obj.hd = YToolkits.bezier(obj.gaitparams.HAlpha,s);
-                    obj.dhd = YToolkits.dbezier(obj.gaitparams.HAlpha,s)*obj.gaitparams.ct;
-                    % swing leg foot placement
-                    if obj.foot_placement ==1
-                        % foot placement in saggital plane + add pitch angle in outputs 
-                        obj.hd(sw_LA) = obj.hd(sw_LA)   + (obj.Kfs_p*(obj.dqx_b_fil-obj.tg_velocity_x_fil) + obj.sagittal_offset + obj.Kfs_d*(obj.dqx_b_fil - obj.v_final(1)))*s_slow  + qpitch*s_slow;
-                        obj.dhd(sw_LA) = obj.dhd(sw_LA) + (obj.Kfs_p*(obj.dqx_b_fil-obj.tg_velocity_x_fil) + obj.sagittal_offset + obj.Kfs_d*(obj.dqx_b_fil - obj.v_final(1)))*ds_slow + qpitch*ds_slow + dqpitch*s_slow;
-                        
-                        % foot placement in frontal plane + add roll angle in outputs 
-                        dqy_b_avg_1 = (obj.lateral_velocity_weight*obj.dqy_b_fil+(1-obj.lateral_velocity_weight)*obj.dqy_b_start);
-                        lateral_ftpl = (obj.Kfl_p*dqy_b_avg_1 + obj.Kfl_d*(dqy_b_avg_1 - obj.v_final_avgy) + abduction_direction*obj.init_lateral_velocity*median([0,1,obj.dqx_b_fil]))*min(1.5*s,1);
-                        if sign(lateral_ftpl) == abduction_direction
-                            p = 1;
-                        else
-                            p = obj.abduction_inward_gain;
-                        end              
-                        obj.hd(sw_abduction) = obj.hd(sw_abduction) +   p * lateral_ftpl * s_slow  + (obj.lateral_offset + obj.lateral_move)*s_slow  - qroll*s_slow ;
-                        obj.dhd(sw_abduction) = obj.dhd(sw_abduction) + p * lateral_ftpl * ds_slow + (obj.lateral_offset + obj.lateral_move)*ds_slow - qroll*ds_slow - dqroll*s_slow;
-                        
-                        % use hip yaw motor on swing leg to maintain the direction ( or not). 
-                        if obj.to_turn ~=1 && obj.keep_direction
-                            direction_keep_term = median([-0.2,0.2,YToolkits.wrap2Pi(obj.tg_yaw - qyaw)]);
-                            obj.hd(sw_rotation) = obj.hd(sw_rotation) + (direction_keep_term+ obj.turning_offset)*s_slow;
-                            obj.dhd(sw_rotation) = obj.dhd(sw_rotation) + (direction_keep_term + obj.turning_offset)*ds_slow;                            
-                        else
-                            obj.hd(sw_rotation) = obj.hd(sw_rotation) + (obj.rotation_move + obj.turning_offset)*s_slow;
-                            obj.dhd(sw_rotation) = obj.dhd(sw_rotation) + (obj.rotation_move + obj.turning_offset)*ds_slow;
-                        end
+                    % pelvis to world
+                    R = YToolkits.Angles.Quaternion_to_Matrix(cassieOutputs.pelvis.vectorNav.orientation);
+                    P_pelvis_world = [pos(1), pos(2), pos(3)];
+                    V_pelvis_world = [pos(4), pos(5), pos(6)];
+                    L_toe_world = P_pelvis_world + Cassie_Left_position_toeBottom(q_abduction_L,q_rotation_L,q_thigh_L,q_thigh_knee_L,q_knee_shin_L,q_shin_tarsus_L,q_toe_L);
+                    R_toe_world = P_pelvis_world + Cassie_Right_position_toeBottom(q_abduction_R,q_rotation_R,q_thigh_R,q_thigh_knee_R,q_knee_shin_L,q_shin_tarsus_R,q_toe_R);
+                    
+                    % compute Cr
+                    y_p = P_pelvis_world(2);
+                    y_pe = obj.y_d - y_p;
+                    y_pe = -y_pe;
+                    y_cp = y_p - obj.Kcp*y_pe;
+                    Cr = (y_cp - R_toe_world(2))/(abs(R_toe_world(2))+abs(L_toe_world(2)));
+                    Frz = Cr * obj.Mg;
+                    Flz = (1-Cr) * obj.Mg;
+                    
+                    y_f = obj.y_h - (abs(L_toe_world(2))+abs(R_toe_world(2)))/2;
+                    q_rlcd = atan(y_f/P_pelvis_world(3));
+                    q_llcd = -atan(y_f/P_pelvis_world(3));    
 
-                    end
-                    % prevent sw abduction from hitting AR's safety bound
-                    obj.hd(sw_abduction) = median([obj.ActuatorLimits(sw_abduction,1) + 0.1,obj.hd(sw_abduction),obj.ActuatorLimits(sw_abduction,2) - 0.1]);
-                        
-                    % flat the toe ( tilt a little bit)
-                    obj.hd(sw_toe) = - obj.h0_joint(sw_thigh) - deg2rad(13) -deg2rad(50); % 13 is the angle between tarsus and thihg, 50 is the angle of transforming frame on foot.
-                    obj.hd(sw_toe) = obj.hd(sw_toe) + obj.toe_tilt_angle*s_fast;
-                    obj.dhd(sw_toe) = 0;
-                    obj.hd(st_toe) = obj.h0(st_toe);
-                    obj.dhd(st_toe) = obj.dh0(st_toe);
-                    
+                    qpitch_e  = obj.qpitch_d - qpitch;
+                    qpitch_le = -qpitch_e;
+                    qpitch_re = -qpitch_e;
 
-                    % Preparation for standing
-                    if obj.stanceLeg == -1 && obj.to_stand_step_count >=1.99
-                        obj.hd(sw_abduction) = obj.hd(sw_abduction) - abduction_direction * obj.final_sw_abduction * s_slow;
-                        obj.dhd(sw_abduction) = obj.dhd(sw_abduction) - abduction_direction * obj.final_sw_abduction * ds_slow;
-                        obj.hd(st_abduction) = obj.hd(st_abduction) + abduction_direction * obj.final_st_abduction * s_slow;
-                        obj.dhd(st_abduction) = obj.dhd(st_abduction) + abduction_direction * obj.final_st_abduction * ds_slow;
-                    end
-                    if obj.stanceLeg == 1 && obj.to_stand_step_count >=0.99
-                        obj.hd(sw_abduction) = obj.hd(sw_abduction) - abduction_direction * obj.pre_final_sw_abduction * s_slow;
-                        obj.dhd(sw_abduction) = obj.dhd(sw_abduction) - abduction_direction * obj.pre_final_sw_abduction * ds_slow;
-                    end
-                    
-                    % compute torque 
-                    obj.y = obj.h0 - obj.hd;
-                    obj.dy = obj.dh0 -obj.dhd;
-                    
-                    [ obj.hd_joint, obj.dhd_joint] = get_IK(obj,obj.hd,obj.dhd);
-                    [ obj.h0_joint, obj.dh0_joint] = get_IK(obj,obj.h0,obj.dh0);
-                    
-                    % make the stance leg passive
-                    if obj.stance_passive == 1
-                        obj.hd_joint(st_LA) = obj.h0_joint(st_LA);
-                        obj.dhd_joint(st_LA) = 0;
-                    end
-                    % Save it for resetting bezier ( for the passive stance Leg)
-                    [ obj.hd, obj.dhd] = get_FK(obj, obj.hd_joint,obj.dhd_joint);
-                    
-                    obj.y_joint= obj.h0_joint - obj.hd_joint;
-                    obj.dy_joint = obj.dh0_joint - obj.dhd_joint;
-                    u = - obj.Kp.*obj.y_joint - obj.Kd.*obj.dy_joint; %not final torque, some compensation for gravity will be added, the torque on stance hip roll and stance hip pitch will be replaced.
-                    
-                    % Torso Control
-                    u_torso_pitch = - obj.Kp_pitch * qpitch - obj.Kd_pitch * dqpitch;
-                    u_torso_roll = obj.Kp_roll * qroll + obj.Kd_roll * dqroll;
-                    if obj.pitch_torso_control == 1
-                        u(3) = (1 - s_L)*u(3) + s_L*u_torso_pitch;
-                        u(8) = (1 - s_R)*u(8) + s_R*u_torso_pitch;
-                    end
-                    if obj.roll_torso_control == 1
-                        u(1) = (1 - s_L)*u(1) + s_L*u_torso_roll;
-                        u(6) = (1 - s_R)*u(6) + s_R*u_torso_roll;
-                    end
-                    
-                    % abduction compensation
-                    if obj.abduction_com == 1
-                        u(st_abduction) = u(st_abduction) + abduction_direction*obj.u_abduction_cp*s_fast;
-                        u(sw_abduction) = u(sw_abduction) - abduction_direction*obj.u_abduction_cp*(1-s_fast);
-                    end
-                    if obj.abduction_swing_com == 1
-                        u(st_abduction) = u(st_abduction) + abduction_direction*obj.u_abduction_swing_cp*(1-s_fast);
-                        u(sw_abduction) = u(sw_abduction) - abduction_direction*obj.u_abduction_swing_cp*s_fast;
-                    end
-                    u(sw_abduction) = u(sw_abduction) - abduction_direction*obj.uHip_gravity_2*s_fast;
-                    % knee compensation
-                    if obj.knee_com == 1
-                        u(st_knee) = u(st_knee) + (obj.u_knee_cp)*s_fast*cos(obj.h0(st_thigh));
-                        u(sw_knee) = u(sw_knee) + (obj.u_knee_cp)*(1-s_fast);
-                    end
-                    % thigh_compensation
-                    if obj.thigh_compensation == 1
-                        u(st_thigh) = u(st_thigh) + obj.u_thigh_cp*s_fast;
-                        u(sw_thigh) = u(sw_thigh) + obj.u_thigh_cp*(1-s_fast);
-                    end
-                    
-                    % Construct Data
-                    Data.hd = obj.hd; 
-                    Data.dhd = obj.dhd;
-                    Data.hd_joint = obj.hd_joint;
-                    Data.dhd_joint = obj.dhd_joint;
-                    Data.y_joint = obj.y_joint ;
-                    Data.dy_joint   = obj.dy_joint ;
+                    qyaw_e = obj.yaw_d - qyaw;         
+                    yaw_le = -qyaw_e + (obj.yaw_joint_d - q_rotation_L); 
+                    yaw_re = -qyaw_e + (obj.yaw_joint_d - q_rotation_R);
 
+                    x_e = obj.x_d - P_pelvis_world(1);
+                    x_le = -x_e;
+                    x_re = -x_e;
+
+                    z_e = obj.z_d - P_pelvis_world(3);            
+                    f_zl = -z_e;
+                    f_zr = -z_e;
+                    
+                    J_L = Cassie_Left_Jacobian_toeBottom(q_abduction_L,q_rotation_L,q_thigh_L,q_thigh_knee_L,q_knee_shin_L,q_shin_tarsus_L,q_toe_L);
+                    J_R = Cassie_Right_Jacobian_toeBottom(q_abduction_R,q_rotation_R,q_thigh_R,q_thigh_knee_R,q_knee_shin_L,q_shin_tarsus_R,q_toe_R);  
+
+                    P_le_world = [q_llcd; qpitch_le; yaw_le; x_le; 0; f_zl];
+                    P_re_world = [q_rlcd; qpitch_re; yaw_re; x_re; 0; f_zr];
+
+                    %roll_pos_world = get_roll(obj,P_pelvis_world);
+                    
+                    f_l =  Kp_c*P_le_world + Kd_c*[0;0;0;V_pelvis_world(1);0;V_pelvis_world(3)] - [0;0;0;0;0;Flz];
+                    f_r =  Kp_c*P_re_world + Kd_c*[0;0;0;V_pelvis_world(1);0;V_pelvis_world(3)] - [0;0;0;0;0;Frz];
+
+                    Tau_L_world = [f_l(1);f_l(2);f_l(3)];
+                    Tau_R_world = [f_r(1);f_r(2);f_r(3)];           
+                    F_L_world = [f_l(4);f_l(5);f_l(6)];
+                    F_R_world = [f_r(4);f_r(5);f_r(6)]; 
+                    
+                    Tau_L_pelvis = R'*Tau_L_world;
+                    Tau_R_pelvis = R'*Tau_R_world;
+                    F_L_pelvis = R'*F_L_world;
+                    F_R_pelvis = R'*F_R_world;
+                    f_l(1:3) = Tau_L_pelvis;
+                    f_r(1:3) = Tau_R_pelvis;
+                    f_l(4:6) = F_L_pelvis;
+                    f_r(4:6) = F_R_pelvis;
+                    
+%                     J_L(1,2) = 0;
+%                     J_L(2,2) = 0;
+%                     J_L(4,2) = 0;
+%                     J_L(6,2) = 0;
+%                     J_R(1,2) = 0;
+%                     J_R(2,2) = 0;
+%                     J_R(4,2) = 0;
+%                     J_R(6,2) = 0;
+                    tau_l = J_L'*f_l;
+                    tau_r = J_R'*f_r;
+
+                    u = [tau_l; tau_r];
+                    
+                    x_e_log = [0;0;0;0;0;-150];
+                    u_x_e = J_L'*x_e_log;
+                    J_t = zeros(30,1);
+                    for k = 1:30
+                        J_t(k) = J_L(k);
+                    end
+                    log_data = [f_l; tau_l;0; u; qpitch; qroll; qyaw; x_e; y_pe; z_e; 
+                                q_toe_L; com_pos(1); 
+                                L_toe_world(3);q_knee_shin_L;q_shin_tarsus_L;
+                                u_x_e];
                 end
                 %% stand up
                 if obj.task == 2              
@@ -675,7 +685,8 @@ classdef FG_Controller <matlab.System & matlab.system.mixin.Propagates & matlab.
                     if obj.task_next == 1
                         obj.t1 = (obj.t1 + (t - obj.t_prev));
                         obj.s1 = obj.t1/obj.shift_time;
-                        lateral_shift = obj.shift_distance * obj.s1;
+                       % lateral_shift = obj.shift_distance * obj.s1;
+                        lateral_shift = 0;
                     else
                         lateral_shift = 0;
                     end
@@ -959,44 +970,50 @@ classdef FG_Controller <matlab.System & matlab.system.mixin.Propagates & matlab.
             %RESETIMPL Reset System object states.
         end % resetImpl
         
-        function [name_1, name_2, name_3, name_4, name_5]  = getInputNamesImpl(~)
+        function [name_1, name_2, name_3, name_4, name_5,name_6]  = getInputNamesImpl(~)
             %GETINPUTNAMESIMPL Return input port names for System block
             name_1 = 't';
             name_2 = 'cassieOutputs';
             name_3 = 'isSim';
             name_4 = 'GaitLibrary';
             name_5 = 'encoder_fil';
+            name_6 = 'pos';
         end % getInputNamesImpl
         
-        function [name_1, name_2] = getOutputNamesImpl(~)
+        function [name_1, name_2, name_3] = getOutputNamesImpl(~)
             %GETOUTPUTNAMESIMPL Return output port names for System block
             name_1 = 'userInputs';
             name_2 = 'Data';
+            name_3 = 'log_data';
         end % getOutputNamesImpl
         
         % PROPAGATES CLASS METHODS ============================================
-        function [out, Data] = getOutputSizeImpl(~)
+        function [out, Data, log_data] = getOutputSizeImpl(~)
             %GETOUTPUTSIZEIMPL Get sizes of output ports.
             out = [1, 1];
             Data = [1, 1];
+            log_data = [38,1];
         end % getOutputSizeImpl
         
-        function [out, Data] = getOutputDataTypeImpl(~)
+        function [out, Data, log_data] = getOutputDataTypeImpl(~)
             %GETOUTPUTDATATYPEIMPL Get data types of output ports.
             out = 'CassieUserInBus';
             Data = 'cassieDataBus';
+            log_data = 'double';
         end % getOutputDataTypeImpl
         
-        function [out, Data] = isOutputComplexImpl(~)
+        function [out, Data, log_data] = isOutputComplexImpl(~)
             %ISOUTPUTCOMPLEXIMPL Complexity of output ports.
             out = false;
             Data = false;
+            log_data = false;
         end % isOutputComplexImpl
         
-        function [out, Data] = isOutputFixedSizeImpl(~)
+        function [out, Data, log_data] = isOutputFixedSizeImpl(~)
             %ISOUTPUTFIXEDSIZEIMPL Fixed-size or variable-size output ports.
             out = true;
             Data = true;
+            log_data = true;
         end % isOutputFixedSizeImpl
     end % methods
 end % classdef
